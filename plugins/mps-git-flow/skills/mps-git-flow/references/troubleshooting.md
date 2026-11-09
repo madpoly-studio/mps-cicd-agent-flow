@@ -122,7 +122,16 @@ Bootstrap (step 0) codes such as `python_missing`, `restart_required` or `store_
 | `protected_branch` | Tried to commit/push on develop/master/release/* | Use `git prepare-branch` to move to the ticket branch first |
 | `nothing_to_commit` | No changes | Fine if the branch already contains the commits (resume) |
 | `commit_failed` | A git hook or config rejected the commit | Show `stderr`; ask a developer |
-| `push_rejected` | The remote branch has commits you do not have | Never force. A developer (or a careful `git pull --no-rebase origin <branch>` with the user's consent) must bring them in first |
+| `push_rejected` | The remote branch has commits you do not have | Never force, never merge them in yourself. A developer must bring them in (by rebase) first |
+| `amend_confirmation_required` | Someone else already pushed commits to this ticket branch; nothing changed | Tell the user whose commits (`other_authors`) and that their changes will be amended into `last_commit`; rerun `git push` with `--amend-confirmed` only if they agree |
+| `remote_branch_ahead` | GitLab has commits on this ticket branch that this machine does not have (a colleague pushed); nothing changed | Stop; a developer brings them in (by rebase) |
+| `remote_branch_changed` | Someone pushed to the ticket branch during our push; the lease refused to overwrite it. The branch on this machine is already one commit; the previous state is in `backup_ref` | Stop; a developer combines the changes |
+| `merged_foreign_work` | The ticket branch contains commits that also sit on another GitLab branch (develop merged into a release bugfix branch, a colleague's ticket branch merged in); squashing would ship them under this ticket. Nothing pushed | Stop; a developer separates the work |
+| `foreign_author_commits` | Unpushed commits on the branch were written by someone else (or by the user with another email) | Stop; a developer checks them |
+| `amend_target_foreign` | The last commit on GitLab has no ticket key (e.g. a suggestion applied on GitLab); nothing is amended into it | Stop; a developer cleans up the branch |
+| `rebase_partial` | Updating the work tree to the newest base stopped half way (a file locked by an open editor, an LFS download error). The branch was not moved; the previous state is in `backup_ref`; nothing pushed | Stop; a developer checks the work tree |
+| `key_required` | `git push` could not read the ticket key from the branch name | Pass `--key=<KEY>` |
+| `merge_commit_on_shared_branch` | A ticket branch with someone else's commits contains a merge commit; it cannot be combined automatically | Stop; a developer cleans it up (the team uses rebase) |
 | `push_denied` | Protected branch / no permission | Ask a maintainer about permissions |
 | `auth_failed` (git) | git credentials rejected | The script already retried once with `MPS_GITLAB_PAT` (https remotes on the MPS GitLab host only). Check the token has `write_repository`. For SSH remotes, the user's SSH key must be set up in GitLab |
 | `git_not_found` | git is not installed / not on PATH | Run step 0 again (the bootstrap script installs git, or asks for a restart of Claude Code: `references/setup-environment.md`) |

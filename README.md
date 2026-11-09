@@ -27,8 +27,9 @@ Jira (https://jira-mps.mto.zing.vn), kể cả khi bạn không phải developer
    `Bug`), kèm kết quả review code; cập nhật trạng thái ticket Jira và gắn link MR vào ticket; cuối cùng liệt kê
    các file còn chưa commit.
 
-Plugin không bao giờ force push, không tự xoá nhánh, không merge MR và không đẩy thẳng vào `develop`, `master`
-hay `release/*`. (MR được tạo với tuỳ chọn "xoá nhánh nguồn": GitLab tự xoá nhánh của ticket sau khi MR được
+Plugin chỉ ghi đè (force push, có `--force-with-lease`) nhánh ticket của chính bạn để giữ mỗi MR một commit; không
+bao giờ ghi đè commit của người khác, không tự xoá nhánh, không merge MR và không đẩy thẳng (hay ghi đè) `develop`,
+`master`, `release/*`. (MR được tạo với tuỳ chọn "xoá nhánh nguồn": GitLab tự xoá nhánh của ticket sau khi MR được
 merge.)
 
 Commit và merge request **không bao giờ có dòng ghi công AI** (`Co-Authored-By: Claude ... <...@anthropic.com>`,
@@ -127,6 +128,13 @@ Claude chỉ commit đúng những file đã qua review phạm vi và review cod
 sẽ review lại cả hai. Nếu review code phát hiện vi phạm một quy tắc `blocker` của dự án, Claude giải thích và có
 thể đề nghị sửa giúp (chỉ sửa khi bạn đồng ý, rồi review lại); nếu không sửa được, bạn cần nhờ developer. Các cảnh
 báo khác không chặn commit và được ghi vào merge request.
+
+**Mỗi merge request chỉ có một commit, và dùng rebase chứ không dùng merge commit.** Trên nhánh ticket bạn có thể
+commit nhiều lần; khi đẩy lên, Claude gộp tất cả thành một commit (đặt tên theo quy tắc bên dưới) nằm ngay trên
+bản mới nhất của nhánh gốc. Sửa thêm sau review thì lần đẩy sau lại gộp vào đúng một commit đó (ghi đè nhánh
+ticket một cách an toàn: nếu ai khác vừa đẩy lên thì dừng, không ghi đè). Nhánh ticket đã có commit của người khác:
+Claude hỏi bạn trước khi gộp thay đổi của bạn vào commit cuối (amend). `develop`, `master`, `release/*` không bao
+giờ bị ghi đè. Đừng tự `git pull` / merge `develop` vào nhánh ticket - Claude tự cập nhật bằng rebase khi đẩy.
 
 Ví dụ: Story `MPS-123` "Thêm màn hình Đăng nhập bằng Google" -> nhánh
 `feature/MPS-123-them-man-hinh-dang-nhap-bang-google`, commit `feat: MPS-123 Thêm màn hình Đăng nhập bằng Google`,

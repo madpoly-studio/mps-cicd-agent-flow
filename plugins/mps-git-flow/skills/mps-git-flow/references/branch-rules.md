@@ -131,6 +131,42 @@ review is bound to the bundle the reviewer read: `git diff-for-review` stamps a 
 every file, the reply must quote it (`BUNDLE: <id>`), and `review classify` rejects replies for older bundles or
 for files changed since (`review_stale`). Incomplete classifications approve nothing (`scope_incomplete`).
 
+## One commit per merge request (rebase, no merge commits)
+
+A ticket branch may collect several commits while the work goes on, but `git push` always publishes it as ONE
+commit on top of the base, so every MR contains exactly one commit named by the naming rule:
+
+- **Only the user's own commits on the branch** (judged by author email, against the commits already on
+  `origin/<branch>`): every commit since the merge base - earlier pushed ones and "Merge remote-tracking branch
+  ..." commits included - is squashed into one commit with `--message` (default: the newest commit on the
+  branch's own first-parent line), then rebased onto the newest `origin/<base>` (`git merge-tree`, git 2.40+;
+  the work tree is updated with `reset --keep`). The rebase is skipped, never forced, on a conflict
+  (`rebase_skipped: conflict`), when it would touch a file with local changes (`local_changes`), overwrite an
+  untracked or ignored file (`local_files`) or un-stage the index (`staged_changes`), or on an older git
+  (`git_too_old`); the branch is still one commit. If the work tree update stops half way (a locked file, an LFS
+  download error) nothing is pushed (`rebase_partial`). An already pushed branch is replaced with
+  `--force-with-lease=<branch>:<the commit we fetched>`.
+- **Never squashed in:** commits that also sit on another GitLab branch - develop merged into a release bugfix
+  branch, a colleague's ticket branch merged in (`merged_foreign_work`) - and unpushed commits written by someone
+  else (`foreign_author_commits`). Both stop before anything changes; a developer separates the work.
+- **Someone else already pushed commits to the ticket branch**: their history stays; after the user agrees
+  (`amend_confirmation_required` -> `--amend-confirmed`) the user's new commits are folded into the last pushed
+  commit (an amend: its author and message are kept) and pushed with the same lease. A last commit without the
+  ticket key (e.g. a suggestion applied on GitLab) is never amended into (`amend_target_foreign`).
+- A push that fails after the branch was combined (network, token) is resumed by running it again: the rewrite
+  is remembered in `branch.<name>.mps-rewrite` until the push succeeds. Backups beyond the newest 5 per branch
+  are deleted after a successful push.
+- Never overwritten: commits on GitLab that this machine does not have (`remote_branch_ahead`, checked after a
+  fetch) or that arrive during the push (`remote_branch_changed`, the lease). Protected branches are never
+  force pushed (`git push` refuses them before anything else).
+- Before the branch moves, its previous commit is kept under `refs/mps-backup/<branch>/<time>-<sha>`.
+- `.env` files and secrets are checked in what is actually published (after the squash), so a file added in one
+  commit and removed in a later one is not published at all.
+- The code-review record of the old tip follows the new commit; a review of an older commit that got folded in
+  together with unreviewed commits counts as `outdated`.
+- GitLab itself still adds one merge commit per MR when the MR is merged (project setting "Merge method"); that
+  is accepted. Merging the base INTO a ticket branch is not: the push rebases instead.
+
 ## Protected branches
 
 `develop`, `master` and every `release/*` branch are never committed to or pushed to directly by this skill:

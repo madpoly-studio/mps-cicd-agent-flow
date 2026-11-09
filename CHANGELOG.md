@@ -4,6 +4,26 @@ Mỗi lần merge vào `main` phải tăng phiên bản (`VERSION` trong `mps.py
 giá trị) và thêm một mục ở đây, cùng một mục ngắn cho người dùng trong `plugins/mps-git-flow/RELEASE_NOTES.md`.
 Mục mới nhất ở trên cùng.
 
+## 0.3.0 - 2026-11-09
+- Quy tắc mới: mỗi merge request chỉ có một commit, dùng rebase thay cho merge commit. `git push` gộp mọi commit
+  của nhánh ticket (kể cả commit "Merge remote-tracking branch ...") thành một commit theo `--message` (mặc định:
+  message của commit mới nhất), rebase lên `origin/<base>` mới nhất (bỏ qua, không ép, khi xung đột / đụng file
+  đang sửa / git cũ: `rebase_skipped`), rồi đẩy lên; nhánh đã đẩy trước đó được ghi đè bằng `--force-with-lease`
+  chỉ trên nhánh ticket. Nhánh `develop` / `master` / `release/*` không bao giờ bị ghi đè.
+- Nhánh ticket đã có commit của người khác: hỏi trước (`amend_confirmation_required`), đồng ý thì gộp (amend) vào
+  commit cuối trên GitLab (giữ tác giả và message) với `--amend-confirmed`.
+- Không bao giờ ghi đè commit của người khác: `remote_branch_ahead` (sau khi fetch), `remote_branch_changed`
+  (lease từ chối), `merge_commit_on_shared_branch`, `amend_target_foreign` (commit cuối không có mã ticket). Trạng
+  thái cũ luôn được lưu ở `refs/mps-backup/...` (giữ 5 bản mới nhất mỗi nhánh).
+- Không bao giờ gộp lẫn code của nhánh khác: `merged_foreign_work` (commit cũng có trên nhánh GitLab khác, ví dụ
+  merge develop vào nhánh bugfix của release), `foreign_author_commits` (commit chưa đẩy của người khác).
+- Rebase không bao giờ đụng file của người dùng: bỏ qua khi có file chưa track / bị ignore trùng đường dẫn
+  (`local_files`) hoặc có thay đổi đã stage (`staged_changes`); cập nhật dở dang thì dừng, không đẩy
+  (`rebase_partial`). Push lỗi sau khi đã gộp (mạng, token) chạy lại được (`resumed`). `git push` nhận `--key`
+  (mặc định lấy từ tên nhánh).
+- `.env` / bí mật được kiểm tra trên nội dung thực sự được đẩy lên (sau khi gộp). Commit gộp không còn dòng ghi công
+  AI. Kết quả review code đi theo commit mới (`outdated` khi commit đã review bị gộp chung với commit chưa review).
+
 ## 0.2.4 - 2026-11-09
 - `plugins/mps-git-flow/RELEASE_NOTES.md` mới: "có gì mới" theo từng phiên bản, viết cho người dùng (có cả các bản
   trước).

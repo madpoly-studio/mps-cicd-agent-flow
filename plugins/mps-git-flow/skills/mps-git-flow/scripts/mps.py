@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.2.4"
+VERSION = "0.3.0"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -1261,9 +1261,8 @@ def classify_git_network_error(stderr, operation):
     """Map git fetch/push stderr to (code, Vietnamese message)."""
     text = (stderr or "").lower()
     if "[rejected]" in text and ("non-fast-forward" in text or "fetch first" in text):
-        return "push_rejected", ("GitLab từ chối vì trên nhánh này đã có thay đổi mới mà máy bạn chưa có. Cần kéo "
-                                 "(pull) code mới về trước rồi đẩy lại. Tuyệt đối không dùng force push — nếu không "
-                                 "chắc, hãy nhờ developer.")
+        return "push_rejected", ("GitLab từ chối vì trên nhánh này đã có thay đổi mới mà máy bạn chưa có. Không tự "
+                                 "pull / merge và tuyệt đối không force push — hãy nhờ developer.")
     if "protected branch" in text or "not allowed to push" in text or "pre-receive hook declined" in text:
         return "push_denied", ("GitLab không cho đẩy lên nhánh này (nhánh được bảo vệ hoặc bạn thiếu quyền). "
                                "Hãy nhờ developer/maintainer kiểm tra quyền.")
@@ -5114,23 +5113,404 @@ def cmd_git_push(args):
     if not ref_exists(root, "refs/remotes/origin/" + args.base):
         raise MpsError("base_not_found", "Chưa có origin/%s trên máy. Hãy chạy git prepare-branch trước." % args.base,
                        base=args.base)
+    key = ticket_key_for_push(args.key, name)
     ensure_recorded_base_matches(root, name, args.base)
-    # Last gate before anything leaves the machine. Inspected per commit (git log), not as a net diff: a secret
-    # added in one commit and deleted in a later one is gone from the diff but still published in history.
-    publish_range = "origin/%s..refs/heads/%s" % (args.base, name)
+    ensure_no_operation_in_progress(root)
+    ensure_no_unmerged(root)
+    # Fresh view of GitLab: the base to rebase onto, and the ticket branch (what a lease may replace, who worked on it).
+    fetched, used_token = run_git_network(root, ["fetch", "--prune", "--no-recurse-submodules", "origin"], cfg)
+    if not fetched.ok:
+        raise_git_network_error(fetched, "fetch")
+    if not ref_exists(root, "refs/remotes/origin/" + args.base):
+        raise MpsError("base_not_found", "Không tìm thấy nhánh gốc origin/%s trên GitLab." % args.base, base=args.base)
+    plan = plan_one_commit(root, name, args.base, key, args.message, args.amend_confirmed)
+    # Last gate before anything leaves the machine, on exactly what will be published.
+    _ensure_publishable(root, name, args.base, plan["new"])
+    planned = plan["new"]
+    plan = apply_one_commit_plan(root, cfg, name, plan, used_token)
+    new_sha = plan["new"]
+    if new_sha != planned:  # the rebase was given up on this machine: check the commit that is pushed instead
+        _ensure_publishable(root, name, args.base, new_sha)
+    refspec = "refs/heads/%s:refs/heads/%s" % (name, name)
+    push_args = ["push", "--recurse-submodules=no", "-u"]
+    remote_sha = plan["remote"]
+    forced = bool(remote_sha) and not is_ancestor(root, remote_sha, new_sha)
+    if forced:
+        if is_protected_branch(name, cfg.branches()):  # never reached (refused above); kept as a second lock
+            raise MpsError("protected_branch", "Không bao giờ ghi đè nhánh %s." % name, branch=name)
+        # Replaces exactly the commit we looked at: if anyone pushed in between, GitLab refuses (stale info).
+        push_args.append("--force-with-lease=refs/heads/%s:%s" % (name, remote_sha))
+    pushed, token_retry = run_git_network(root, push_args + ["origin", refspec], cfg)
+    if not pushed.ok:
+        raise git_push_error(pushed, plan.get("backup_ref"))
+    run_git(["config", "--local", pushed_config_key(name), new_sha], root)
+    remap_committed_review(root, name, plan["review_old"], new_sha)
+    _clear_pending_rewrite(root, name)
+    _prune_backups(root, name)
+    result = {"branch": name, "pushed_commit": new_sha, "remote": sanitize_remote_url(origin_url(root)),
+              "used_token_fallback": used_token or token_retry, "forced": forced}
+    for item in ("rewrite", "commits_combined", "rebased", "rebase_skipped", "backup_ref", "other_authors",
+                 "attribution_removed", "resumed"):
+        result[item] = plan.get(item)
+    return result
+
+
+def _ensure_publishable(root, name, base, sha):
+    """No .env file and no hard secret in what `sha` adds on top of origin/<base>. Inspected per commit (git log), not
+    as a net diff: on the amend path a colleague's older commits stay in history and are published as they are."""
+    publish_range = "origin/%s..%s" % (base, sha)
     env_files = sorted(set(p for p in _commit_touched_files(root, publish_range) if is_env_file(p)))
     if env_files:
         raise MpsError("env_file", "Nhánh %s có commit chứa file .env (token/bí mật). Không được đẩy lên — hãy nhờ "
                                    "developer gỡ file khỏi các commit đó." % name, files=env_files)
     _ensure_no_hard_secrets(_commit_patches(root, publish_range), "các commit sắp đẩy lên")
-    refspec = "refs/heads/%s:refs/heads/%s" % (name, name)
-    pushed, used_token = run_git_network(root, ["push", "--recurse-submodules=no", "-u", "origin", refspec], cfg)
-    if not pushed.ok:
-        raise_git_network_error(pushed, "push")
-    pushed_sha = run_git(["rev-parse", "refs/heads/" + name], root).stdout.strip()
-    run_git(["config", "--local", pushed_config_key(name), pushed_sha], root)
-    return {"branch": name, "pushed_commit": pushed_sha, "remote": sanitize_remote_url(origin_url(root)),
-            "used_token_fallback": used_token}
+
+
+# ---------------------------------------------------------------------------
+# One commit per merge request (rebase, never merge commits)
+# ---------------------------------------------------------------------------
+
+BACKUP_REF_PREFIX = "refs/mps-backup/"
+BACKUPS_KEPT = 5
+REWRITE_CONFIG_NAME = "mps-rewrite"
+MERGE_TREE_MIN_GIT = (2, 40)  # git merge-tree --write-tree --merge-base
+_TICKET_BRANCH_KEY_RE = re.compile(r"^(?:feature|bugfix|hotfix)/([A-Za-z][A-Za-z0-9_]*-[0-9]+)(?:-|$)")
+
+
+def ticket_key_for_push(key, branch):
+    if key:
+        return normalize_issue_key(key)
+    match = _TICKET_BRANCH_KEY_RE.match(branch or "")
+    if not match:
+        raise MpsError("key_required", "Không đoán được mã ticket từ tên nhánh %s; hãy chạy lại với --key=<KEY>."
+                       % branch, branch=branch)
+    return normalize_issue_key(match.group(1))
+
+
+def is_ancestor(root, ancestor, descendant):
+    return run_git(["merge-base", "--is-ancestor", ancestor, descendant], root, check=False).ok
+
+
+def git_version(root):
+    match = re.search(r"(\d+)\.(\d+)", run_git(["version"], root).stdout)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def range_commits(root, rev_range, *options):
+    """[{sha, parents, name, email, subject}] of a range, newest first (merge commits included)."""
+    output = run_git(["log", "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%s%x1e"] + list(options) + [rev_range], root).stdout
+    commits = []
+    for record in output.split("\x1e"):
+        fields = record.strip("\n").split("\x1f")
+        if len(fields) == 5 and fields[0]:
+            commits.append({"sha": fields[0], "parents": fields[1].split(), "name": fields[2], "email": fields[3],
+                            "subject": fields[4]})
+    return commits
+
+
+def is_same_person(commit, my_name, my_email):
+    if my_email and commit.get("email"):
+        return commit["email"].strip().casefold() == my_email.strip().casefold()
+    return (commit.get("name") or "").strip().casefold() == (my_name or "").strip().casefold()
+
+
+def _author_label(commit):
+    return "%s <%s>" % (commit["name"], commit["email"])
+
+
+def commit_message(root, sha):
+    return run_git(["log", "-1", "--format=%B", sha], root).stdout
+
+
+def _commit_tree(root, tree, parents, message, author=None):
+    """New commit object (no ref moves). author: (name, email, date) to keep, as `git commit --amend` does."""
+    env = git_base_env()
+    if author:
+        env["GIT_AUTHOR_NAME"], env["GIT_AUTHOR_EMAIL"], env["GIT_AUTHOR_DATE"] = author
+    args = ["commit-tree", tree]
+    for parent in parents:
+        args += ["-p", parent]
+    text = message.rstrip("\n") + "\n"
+    return run_git(args, root, env=env, input_bytes=text.encode("utf-8")).stdout.strip()
+
+
+def _rebase_one_commit(root, commit, old_parent, onto):
+    """(rebased commit or None, reason). Pure object work: the working tree is not touched here."""
+    if git_version(root) < MERGE_TREE_MIN_GIT:
+        return None, "git_too_old"
+    merged = run_git(["merge-tree", "--write-tree", "--merge-base=" + old_parent, onto, commit], root, check=False)
+    if merged.code == 1:
+        return None, "conflict"
+    if not merged.ok or not merged.stdout.strip():
+        return None, "merge_tree_failed"
+    tree = merged.stdout.split("\n", 1)[0].strip()
+    return _commit_tree(root, tree, [onto], commit_message(root, commit)), None
+
+
+def _rewrite_config_key(branch):
+    return "branch.%s.%s" % (branch, REWRITE_CONFIG_NAME)
+
+
+def _pending_rewrite(root, branch):
+    """(remote, old, new) of a rewrite whose push did not go through yet, or None."""
+    value = run_git(["config", "--local", "--get", _rewrite_config_key(branch)], root, check=False).stdout.split()
+    return tuple(None if v == "-" else v for v in value) if len(value) == 3 else None
+
+
+def _clear_pending_rewrite(root, branch):
+    run_git(["config", "--local", "--unset", _rewrite_config_key(branch)], root, check=False)
+
+
+def _merged_in_foreign_commits(root, base_ref, name, old):
+    """Commits of base..branch that also sit on ANOTHER GitLab branch: work merged in from develop or a colleague's
+    ticket. Squashed, they would ship under this ticket (e.g. unreleased develop code into a release/* MR)."""
+    in_range = set(c["sha"] for c in range_commits(root, "%s..%s" % (base_ref, old), "--no-merges"))
+    if not in_range:
+        return []
+    # --exclude patterns of --remotes are written without "refs/remotes/" (git rev-list docs).
+    only_here = run_git(["rev-list", "--no-merges", old, "--not", base_ref, "--exclude=origin/" + name,
+                         "--exclude=origin/HEAD", "--remotes=origin"], root).stdout.split()
+    elsewhere = in_range - set(only_here)
+    return [c for c in range_commits(root, "%s..%s" % (base_ref, old), "--no-merges") if c["sha"] in elsewhere]
+
+
+def plan_one_commit(root, name, base, key, message, amend_confirmed):
+    """Decide how `name` becomes ONE commit on top of origin/<base> before it is pushed. Nothing is changed here.
+
+    - Only the user's own work on the branch: squashed into one commit with the ticket's commit message, rebased
+      onto the newest origin/<base> when that applies cleanly (never a merge commit).
+    - Someone else already pushed commits to this ticket branch: their history is kept; the user's new commits are
+      folded into the last pushed commit (an amend), only after the user agreed (`amend_confirmed`).
+    - Work merged in from another GitLab branch, or local commits by someone else: never folded in silently.
+    Returns {old, new, remote, rewrite, ...}; `new` == `old` when the branch already is in shape.
+    """
+    branch_ref = "refs/heads/" + name
+    base_ref = "refs/remotes/origin/" + base
+    old = run_git(["rev-parse", branch_ref], root).stdout.strip()
+    base_tip = run_git(["rev-parse", base_ref], root).stdout.strip()
+    remote_ref = "refs/remotes/origin/" + name
+    remote = run_git(["rev-parse", remote_ref], root).stdout.strip() if ref_exists(root, remote_ref) else None
+    plan = {"old": old, "new": old, "remote": remote, "base_tip": base_tip, "rewrite": "none", "commits_combined": 0,
+            "rebased": False, "rebase_skipped": None, "other_authors": [], "attribution_removed": False,
+            "resumed": False, "review_old": old}
+    resumed_from = None
+    if remote and not is_ancestor(root, remote, old):
+        pending = _pending_rewrite(root, name)
+        # Our own rewrite whose push failed (network, token...): the local branch is that rewrite (plus any newer
+        # commits), and GitLab still has exactly the commit it was planned against.
+        if pending and pending[0] == remote and pending[2] and is_ancestor(root, pending[2], old):
+            plan["resumed"] = True
+            if pending[2] == old:  # exactly the planned commit: push it again, review record still to move
+                plan["review_old"] = pending[1]
+                return plan
+            resumed_from = pending[2]
+        else:
+            raise MpsError("remote_branch_ahead",
+                           "Nhánh %s trên GitLab có commit mà máy bạn chưa có (thường là người khác vừa đẩy lên). Không "
+                           "ghi đè lên commit của người khác. Hãy nhờ developer gộp các thay đổi." % name, branch=name)
+    commits = range_commits(root, "%s..%s" % (base_ref, old))
+    if not commits:
+        return plan
+    foreign = _merged_in_foreign_commits(root, base_ref, name, old)
+    if foreign:
+        raise MpsError("merged_foreign_work",
+                       "Nhánh %s có %d commit lấy từ nhánh khác trên GitLab (thường do merge develop hoặc nhánh của "
+                       "người khác vào). Gộp lại sẽ đưa code đó vào merge request của ticket %s, nên chưa đẩy gì. Hãy "
+                       "nhờ developer tách ra." % (name, len(foreign), key), branch=name,
+                       commits=[{"sha": c["sha"], "subject": c["subject"], "author": _author_label(c)}
+                                for c in foreign[:FOREIGN_COMMITS_REPORTED]], commit_count=len(foreign))
+    my_name, my_email = git_identity(root)
+    pushed = range_commits(root, "%s..%s" % (base_ref, remote)) if remote else []
+    others = [c for c in pushed if not is_same_person(c, my_name, my_email)]
+    # Already part of this ticket's history: what GitLab has, and our own earlier rewrite (an amend keeps the
+    # colleague as author) whose push failed.
+    known = set(c["sha"] for c in pushed)
+    if resumed_from:
+        known.update(c["sha"] for c in range_commits(root, "%s..%s" % (base_ref, resumed_from)))
+    local_others = [c for c in commits if c["sha"] not in known and len(c["parents"]) < 2
+                    and not is_same_person(c, my_name, my_email)]
+    if local_others:
+        raise MpsError("foreign_author_commits",
+                       "Nhánh %s có commit chưa đẩy lên của người khác (%s), nên không tự gộp. Nếu đó là chính bạn "
+                       "(ví dụ commit bằng email khác), hãy nhờ developer kiểm tra."
+                       % (name, ", ".join(sorted(set(_author_label(c) for c in local_others)))), branch=name,
+                       other_authors=sorted(set(_author_label(c) for c in local_others)))
+    if others:
+        return _plan_amend(root, plan, name, key, remote, old, others, (my_name, my_email), amend_confirmed)
+    return _plan_squash(root, plan, commits, old, base_ref, base_tip, message)
+
+
+def _plan_squash(root, plan, commits, old, base_ref, base_tip, message):
+    merge_base = run_git(["merge-base", base_ref, old], root).stdout.strip()
+    if message is None:  # default: the newest own commit on the branch's own line (never a merged-in one)
+        line = range_commits(root, "%s..%s" % (base_ref, old), "--first-parent", "--no-merges")
+        message = commit_message(root, (line or commits)[0]["sha"])
+    message, plan["attribution_removed"] = strip_ai_attribution(message)
+    if not message.strip():
+        raise MpsError("empty_message", "Nội dung commit đang trống.")
+    single = commits[0]
+    if len(commits) == 1 and len(single["parents"]) == 1 and \
+            commit_message(root, single["sha"]).rstrip("\n") == message.rstrip("\n"):
+        squashed = single["sha"]  # already one commit with the right message
+    else:
+        squashed = _commit_tree(root, old + "^{tree}", [merge_base], message)
+        plan.update(rewrite="squashed", commits_combined=len(commits))
+    if merge_base != base_tip:
+        rebased, reason = _rebase_one_commit(root, squashed, merge_base, base_tip)
+        if rebased:
+            plan.update(rebased=True, rebased_commit=rebased)
+        else:
+            plan["rebase_skipped"] = reason
+    plan["squashed"] = squashed
+    plan["new"] = plan.get("rebased_commit") or squashed
+    if plan["new"] != old and plan["rewrite"] == "none":
+        plan["rewrite"] = "rebased"
+    return plan
+
+
+def _plan_amend(root, plan, name, key, remote, old, others, me, amend_confirmed):
+    authors = sorted(set(_author_label(c) for c in others))
+    plan["other_authors"] = authors
+    if remote == old:
+        return plan  # nothing new on this machine: the pushed history stays as it is
+    mine = range_commits(root, "%s..%s" % (remote, old))
+    last = range_commits(root, "%s^!" % remote)[0]  # just the last pushed commit
+    if any(len(c["parents"]) > 1 for c in mine) or len(last["parents"]) > 1:
+        raise MpsError("merge_commit_on_shared_branch",
+                       "Nhánh %s (đã có người khác làm) có merge commit, nên không gộp tự động được. Hãy nhờ "
+                       "developer xử lý (team dùng rebase, không dùng merge commit)." % name, branch=name)
+    if not mentions_key(last["subject"], key):
+        # e.g. a reviewer's "Apply 1 suggestion(s)" commit made on GitLab: amending it would give the MR a commit
+        # without the ticket key, under someone else's name.
+        raise MpsError("amend_target_foreign",
+                       "Commit cuối trên nhánh %s (\"%s\" của %s) không mang mã ticket %s, nên không gộp vào đó. Hãy "
+                       "nhờ developer xử lý." % (name, last["subject"], last["name"], key), branch=name,
+                       last_commit={"sha": remote, "subject": last["subject"], "author": _author_label(last)})
+    author_date = run_git(["log", "-1", "--format=%ad", "--date=raw", remote], root).stdout.strip()
+    if not amend_confirmed:
+        my_name = (me[0] or "").strip().casefold()
+        raise MpsError("amend_confirmation_required",
+                       "Nhánh %s đã có commit của người khác (%s). Để mỗi merge request vẫn chỉ có một commit, các thay "
+                       "đổi mới của bạn sẽ được gộp (amend) vào commit cuối cùng trên GitLab: \"%s\" của %s. Hãy hỏi "
+                       "người dùng; chỉ chạy lại với --amend-confirmed khi họ đồng ý. Chưa có gì thay đổi."
+                       % (name, ", ".join(authors), last["subject"], last["name"]),
+                       branch=name, other_authors=authors, new_commits=len(mine),
+                       same_name_as_you=any((c["name"] or "").strip().casefold() == my_name for c in others),
+                       last_commit={"sha": remote, "subject": last["subject"], "author": _author_label(last)})
+    message, plan["attribution_removed"] = strip_ai_attribution(commit_message(root, remote))
+    plan["new"] = _commit_tree(root, old + "^{tree}", last["parents"], message,
+                               author=(last["name"], last["email"], author_date))
+    plan.update(rewrite="amended", commits_combined=len(mine) + 1)
+    return plan
+
+
+def _backup_ref(name, sha):
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return "%s%s/%s-%s" % (BACKUP_REF_PREFIX, name, stamp, sha[:8])
+
+
+def _prune_backups(root, name):
+    """Keep the newest BACKUPS_KEPT backups of the branch (old ones pin old blobs, e.g. large Unity assets)."""
+    refs = run_git(["for-each-ref", "--sort=-refname", "--format=%(refname)", BACKUP_REF_PREFIX + name + "/"],
+                   root, check=False).stdout.split()
+    for ref in refs[BACKUPS_KEPT:]:
+        run_git(["update-ref", "-d", ref], root, check=False)
+
+
+def _rebase_blocker(root, old, new):
+    """Why moving the work tree from `old` to `new` must not be tried, or None. `reset --keep` protects tracked files
+    with local changes, but would overwrite untracked / ignored files and un-stage the index."""
+    if staged_paths(root):
+        return "staged_changes"
+    added = _name_only_z(root, ["--diff-filter=A", old, new])
+    if any(os.path.lexists(os.path.join(root, *path.split("/"))) for path in added):
+        return "local_files"
+    return None
+
+
+def apply_one_commit_plan(root, cfg, name, plan, used_token):
+    """Move the branch to the planned commit. The old commit is kept under refs/mps-backup/ first, so nothing is lost.
+
+    On the checked-out branch: same content -> `reset --soft` (files untouched); rebased content -> `reset --keep`
+    (brings in the base's new files). The rebase is given up (the not-rebased single commit is used) when it could
+    touch local files; if the work tree is left half-updated, it stops before pushing.
+    """
+    old, new = plan["old"], plan["new"]
+    if new == old:
+        return plan
+    on_branch = current_branch(root) == name
+    if plan.get("rebased") and on_branch:
+        blocker = _rebase_blocker(root, old, new)
+        if blocker:
+            plan.update(rebased=False, rebase_skipped=blocker, new=plan["squashed"])
+            new = plan["new"]
+            if new == old:
+                return plan
+    backup = _backup_ref(name, old)
+    run_git(["update-ref", backup, old], root)
+    plan["backup_ref"] = backup
+    # Remembered before the branch moves: if the push then fails, the next run knows the rewrite is ours.
+    run_git(["config", "--local", _rewrite_config_key(name),
+             "%s %s %s" % (plan["remote"] or "-", plan["review_old"], new)], root)
+    if not on_branch:
+        run_git(["update-ref", "-m", "mps: one commit per merge request", "refs/heads/" + name, new, old], root)
+        return plan
+    if plan.get("rebased"):
+        before = git_status(root)
+        # Network env: a Git LFS checkout downloads files with the same credentials as fetch.
+        kept = run_git(["reset", "-q", "--keep", new], root, env=git_network_env(cfg, used_token), check=False)
+        if kept.ok:
+            return plan
+        if git_status(root) != before or head_sha(root) != old:
+            _clear_pending_rewrite(root, name)
+            raise MpsError("rebase_partial",
+                           "Cập nhật nhánh %s lên bản mới nhất của nhánh gốc bị dừng giữa chừng (file đang bị mở / "
+                           "khoá, hoặc tải file LFS lỗi), nên chưa đẩy gì. Bản trước đó được giữ ở %s. Hãy nhờ developer "
+                           "kiểm tra." % (name, backup), branch=name, backup_ref=backup, stderr=kept.stderr.strip())
+        plan.update(rebased=False, rebase_skipped="local_changes", new=plan["squashed"])
+        new = plan["new"]
+        if new == old:
+            _clear_pending_rewrite(root, name)
+            run_git(["update-ref", "-d", backup], root)
+            plan["backup_ref"] = None
+            return plan
+        run_git(["config", "--local", _rewrite_config_key(name),
+                 "%s %s %s" % (plan["remote"] or "-", plan["review_old"], new)], root)
+    run_git(["reset", "-q", "--soft", new], root)
+    return plan
+
+
+def git_push_error(pushed, backup_ref):
+    text = (pushed.stderr or "").lower()
+    if "stale info" in text or ("[rejected]" in text and "force-with-lease" in text):
+        return MpsError("remote_branch_changed",
+                        "Trong lúc gộp commit, nhánh trên GitLab vừa có commit mới (thường do người khác đẩy lên) nên "
+                        "không ghi đè. Trên máy bạn nhánh đã gộp xong%s. Hãy nhờ developer gộp với thay đổi mới."
+                        % ((", bản trước khi gộp được lưu ở %s" % backup_ref) if backup_ref else ""),
+                        backup_ref=backup_ref, stderr=pushed.stderr.strip())
+    code, message = classify_git_network_error(pushed.stderr, "push")
+    return MpsError(code, message, stderr=pushed.stderr.strip(), backup_ref=backup_ref)
+
+
+def remap_committed_review(root, branch, old, new):
+    """The code review recorded for the old tip describes the same change after the squash / rebase / amend. A review
+    of an older commit that was folded in no longer matches anything: it is marked superseded (reason `outdated`)."""
+    if old == new:
+        return
+    review = _read_json(committed_review_path(root))
+    if not review or review.get("branch") != branch or not review.get("committed_as"):
+        return
+    sha = review["committed_as"]
+    if sha == old:
+        review["committed_as"] = new
+    elif is_ancestor(root, sha, old) and not is_ancestor(root, sha, new):
+        review["committed_as"], review["superseded"] = None, True
+    else:
+        return
+    try:
+        _write_json(committed_review_path(root), review)
+    except OSError:
+        pass  # best effort: at worst mr ensure reports not_in_branch and attaches nothing
 
 
 # ---------------------------------------------------------------------------
@@ -5272,6 +5652,8 @@ def _select_committed_review(root, source):
         return None, "no_review"
     if review.get("branch") != source:
         return None, "other_branch"
+    if review.get("superseded"):  # its commit was folded into the single MR commit together with unreviewed ones
+        return None, "outdated"
     sha = review.get("committed_as")
     source_ref = _source_ref(root, source)
     if not sha or not run_git(["merge-base", "--is-ancestor", sha, source_ref], root, check=False).ok:
@@ -5499,9 +5881,15 @@ def build_parser():
     p.add_argument("--include-out-of-scope", nargs="+", metavar="FILE",
                    help="files (also in --files) the user explicitly chose to commit although the review did not")
     p.set_defaults(handler=cmd_git_commit)
-    p = git.add_parser("push", help="push the branch (never forced)")
+    p = git.add_parser("push", help="make the ticket branch ONE commit rebased on origin/BASE, check it, push it "
+                                    "(lease-protected force only on the own ticket branch)")
     p.add_argument("--branch", required=True)
     p.add_argument("--base", required=True, help="base branch; commits in origin/BASE...BRANCH are checked first")
+    p.add_argument("--message", help="message of the single commit (the ticket's commit message); default: the "
+                                     "message of the newest commit on the branch")
+    p.add_argument("--key", help="ticket key (default: from the branch name, e.g. feature/MPS-1-x -> MPS-1)")
+    p.add_argument("--amend-confirmed", action="store_true",
+                   help="the user agreed to fold their new commits into the last commit someone else pushed")
     p.set_defaults(handler=cmd_git_push)
 
     mr = _subcommands(groups.add_parser("mr", help="GitLab merge requests"), "command")

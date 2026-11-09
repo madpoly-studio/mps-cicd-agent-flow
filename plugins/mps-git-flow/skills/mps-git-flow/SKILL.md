@@ -68,7 +68,7 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 | `review classify --base=B --result-file=F` | check the scope reviewer's `FILES:` block, derive commit / exclude lists, save them |
 | `review findings --base=B --result-file=F` | check the code reviewer's `FINDINGS:` block against the bundle and the rules, save the result |
 | `git commit --message=M --files f1 f2 ... [--include-out-of-scope f ...]` | commit exactly those reviewed files |
-| `git push --branch=N --base=B` | check every commit vs origin/B for .env/secrets, then push (never forced) |
+| `git push --branch=N --base=B --message=M [--amend-confirmed]` | make the branch ONE commit (message M) rebased on origin/B, check it for .env/secrets, push (lease-protected force only on the own ticket branch) |
 | `mr ensure --source=S --target=T --title=X --description=D --key=K --type=story\|bug [--code-review]` | verify target = recorded base, reuse / create the MR (assigned to the user, labelled Enhancement / Bug), add the code-review report |
 
 ## Workflow
@@ -379,7 +379,8 @@ Two reviews of the same snapshot run side by side:
 Show a short summary and ask for an explicit "yes":
 - ticket (key + link), type, phase
 - branches: "tách từ `<base_branch>` -> nhánh `<branch>` -> merge vào `<base_branch>`"
-- the commit message
+- the commit message, and that the merge request will contain exactly ONE commit with it (earlier commits of this
+  ticket branch are combined into it and it is rebased onto the newest `<base_branch>`)
 - **Sẽ commit:** the exact file list
 - **Không commit (ngoài phạm vi — giữ nguyên trên máy):** every excluded / unclassified file
 - the reviewer verdict and any concerns
@@ -425,9 +426,38 @@ file, and then pass it in both `--files` and `--include-out-of-scope`. Never add
      will get no code-review report; tell the user.
    - Keep `left_uncommitted` (changed files still not committed) for the final report. Relay
      `unstaged_other_files` if non-empty (files staged earlier that were left out; still changed on disk).
-2. `git push --branch=<branch> --base=<base_branch>`. It refuses `env_file` / `secret_detected` found in any
-   commit about to be published, and `base_mismatch` if the base differs from the recorded one.
-   `push_rejected` -> explain; never force. Auth errors -> troubleshooting.
+2. `git push --branch=<branch> --base=<base_branch> --key=<KEY> --message="<commit_message>"`. Team rule: **one merge
+   request = one commit, rebased, never a merge commit**. The script does it; never squash, rebase, merge or
+   force push yourself.
+   - Only the user's own commits on the branch -> all of them (also earlier pushed ones, and any "Merge
+     remote-tracking branch ..." commits) become ONE commit with `<commit_message>`, rebased onto the newest
+     `origin/<base_branch>`. If the branch was already pushed, it is replaced with a lease-protected force push
+     (`forced: true`) - only ever this ticket branch, never develop / master / release/*.
+   - Someone else already pushed commits to this ticket branch -> `amend_confirmation_required` (nothing changed):
+     tell the user, in Vietnamese, whose commits are there (`other_authors`) and that their new changes will be
+     folded (amend) into the last commit on GitLab (`last_commit`: subject, author; that commit keeps its author
+     and message, `--message` is not used); ask. `same_name_as_you: true` -> one of those authors has the user's
+     own name with another email (e.g. another computer): say so, it may be the user themselves. Only if they
+     agree, run the same command again with `--amend-confirmed`. If they decline, stop and send them to a
+     developer.
+   - Result: `rewrite` (`none` / `squashed` / `rebased` / `amended`), `commits_combined`, `rebased`,
+     `backup_ref` (the previous state, kept on this machine - mention it only if something went wrong).
+     `rebase_skipped`: `conflict` -> the change conflicts with newer code on the base; the MR may show a
+     conflict: tell the user a developer must resolve it. `local_changes` / `local_files` / `staged_changes` ->
+     not rebased so that the user's uncommitted, untracked or staged files stay exactly as they are (fine; it is
+     still one commit). `git_too_old` -> not rebased (fine).
+   - A failed push (network, token, ...) after the branch was combined is safe to retry with the same command
+     (`resumed: true`); never "fix" it with git yourself.
+   - It refuses `env_file` / `secret_detected` found in what is about to be published, and `base_mismatch` if the
+     base differs from the recorded one.
+   - Nothing was pushed or overwritten; stop and send the user to a developer: `merged_foreign_work` (the branch
+     contains work merged in from develop or another GitLab branch - list `commits`), `foreign_author_commits`
+     (unpushed commits written by someone else), `amend_target_foreign` (the last commit on GitLab has no ticket
+     key, e.g. a suggestion applied on GitLab), `remote_branch_ahead` (someone pushed to this branch and this
+     machine does not have it yet), `remote_branch_changed` (someone pushed while we were pushing),
+     `merge_commit_on_shared_branch`, `rebase_partial` (updating the files to the newest base stopped half way,
+     e.g. a file locked by an open editor; the branch was NOT moved). `push_rejected` -> explain; never force.
+     Auth errors -> troubleshooting.
 3. `mr ensure --source=<branch> --target=<base_branch> --title="<mr_title>" --description="<mr_description>"
    --key=<KEY> --type=<story|bug> --code-review`. The target is ALWAYS the base the branch was made from, and the
    phase rules are checked again for it (`phase_rule_violation`: a Story never goes into release/* or master).
@@ -481,8 +511,12 @@ step 6 runs again before the merge request is created.
 
 ## Hard rules
 
-- Never force push (`--force`, `--force-with-lease`, `+refspec`), never `git reset --hard`, never rebase or
-  rewrite shared branches, never `git clean`.
+- Never force push yourself (`--force`, `--force-with-lease`, `+refspec`), never `git reset --hard`, never
+  rebase or rewrite branches yourself, never `git clean`. The only history rewrite allowed is the one
+  `mps.py git push` does on the ticket branch (one commit per MR, lease-protected); develop / master /
+  release/* are never force pushed.
+- Never merge the base into the ticket branch (`git pull`, `git merge origin/develop`, ...): the team uses rebase;
+  `git push` brings the branch up to date with the base itself.
 - The agent never deletes branches itself (local or remote). GitLab removes the ticket branch automatically
   after the MR is merged (the MR is created with "delete source branch").
 - Never commit `.env` files or tokens; never print, echo, log or repeat a token.

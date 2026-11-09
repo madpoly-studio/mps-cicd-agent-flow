@@ -4,6 +4,14 @@ Mỗi phiên bản có một mục ngắn ở đây (mới nhất ở trên), vi
 Claude Code kế tiếp sẽ tự hiện mục của phiên bản mới (một lần cho mỗi phiên bản). Chi tiết kỹ thuật: `CHANGELOG.md`
 ở gốc repo.
 
+## 0.3.0 - 2026-11-09
+- Quy tắc mới của team: mỗi merge request chỉ có một commit. Bạn vẫn commit bao nhiêu lần cũng được; khi đẩy lên,
+  Claude tự gộp thành một commit đặt tên đúng quy tắc.
+- Dùng rebase thay cho merge: khi đẩy, nhánh của bạn được đặt lên bản mới nhất của nhánh gốc. Đừng tự pull /
+  merge develop vào nhánh ticket nữa.
+- Nhánh ticket đã có commit của người khác: Claude hỏi bạn trước khi gộp. Không bao giờ ghi đè thay đổi của người
+  khác hay các nhánh develop / release / master.
+
 ## 0.2.4 - 2026-11-09
 - Sau mỗi lần plugin được cập nhật, Claude Code hiện ngắn gọn phiên bản mới có gì thay đổi (chỉ một lần).
 

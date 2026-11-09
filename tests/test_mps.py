@@ -985,9 +985,258 @@ class GitFlowTests(unittest.TestCase):
         self.write("key.pem", "-----BEGIN RSA PRIVATE KEY-----\n")
         self.git("add", "key.pem")
         self.git("commit", "-q", "-m", "feat: MPS-1 key")
+        # The branch is pushed as ONE commit: the .env removed by a later commit is not published any more, but the
+        # key in the final content still is, and blocks.
         self.assertEqual(self.mps("git", "push", "--branch", "feature/MPS-1-x", "--base", "develop")["error"],
-                         "env_file")
+                         "secret_detected")
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "feature/MPS-1-x").strip(), "")
+        self.assertEqual(self.git("for-each-ref", mps.BACKUP_REF_PREFIX).strip(), "")  # refused before any rewrite
+
+    # -- one commit per merge request, rebase instead of merge commits ----
+
+    def remote_commits(self, branch, base="develop"):
+        self.git("fetch", "-q", "origin")
+        return self.git("rev-list", "origin/%s..origin/%s" % (base, branch)).split()
+
+    def commit_file(self, path, text, message, cwd=None):
+        self.write(path, text, root=cwd)
+        self.git("add", path, cwd=cwd)
+        self.git("commit", "-q", "-m", message, cwd=cwd)
+
+    def push(self, branch, *extra):
+        return self.mps("git", "push", "--branch=" + branch, "--base=develop", *extra)
+
+    def test_push_squashes_own_commits_into_one_rebased_commit(self):
+        branch = "feature/MPS-90-a"
+        self.prepare(branch, "MPS-90")
+        self.commit_file("a.txt", "a\n", "feat: MPS-90 a")
+        # The pattern from the team's history: develop merged INTO the ticket branch, plus an AI-attributed commit.
+        self.push_upstream("develop", "dev1.txt", "1\n", "feat: MPS-91 other work")
+        self.git("fetch", "-q", "origin")
+        self.git("merge", "-q", "--no-edit", "origin/develop")
+        self.commit_file("b.txt", "b\n", "wip\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
+        self.push_upstream("develop", "dev2.txt", "2\n", "feat: MPS-92 more work")
+        old_head = self.head()
+        pushed = self.push(branch, "--message=feat: MPS-90 Tính năng A")
+        self.assertEqual((pushed["rewrite"], pushed["commits_combined"], pushed["rebased"], pushed["forced"]),
+                         ("squashed", 3, True, False))
+        commits = self.remote_commits(branch)
+        self.assertEqual(commits, [pushed["pushed_commit"]])
+        self.assertEqual(self.git("rev-parse", commits[0] + "^").strip(), self.git("rev-parse", "origin/develop").strip())
+        self.assertEqual(self.git("log", "-1", "--format=%B", commits[0]).strip(), "feat: MPS-90 Tính năng A")
+        self.assertEqual(sorted(self.git("show", "--name-only", "--format=", commits[0]).split()), ["a.txt", "b.txt"])
+        self.assertEqual(self.head(), commits[0])
+        self.assertEqual(self.read("dev2.txt"), "2\n")  # the rebase brought the base's new work into the work tree
+        self.assertEqual(self.git("rev-parse", pushed["backup_ref"]).strip(), old_head)  # nothing is lost
+        self.assertEqual(self.git("rev-list", "--merges", "origin/develop.." + branch).strip(), "")
+
+    def test_review_fix_is_folded_in_with_a_lease_protected_force_push(self):
+        branch = "feature/MPS-93-a"
+        self.prepare(branch, "MPS-93")
+        self.commit_file("a.txt", "a\n", "feat: MPS-93 a")
+        first = self.push(branch)
+        self.assertEqual((first["rewrite"], first["forced"], first["backup_ref"]), ("none", False, None))
+        self.assertEqual(self.push(branch)["rewrite"], "none")  # already in shape: nothing rewritten again
+        self.commit_file("a.txt", "a fixed after review\n", "feat: MPS-93 a")
+        second = self.push(branch)
+        self.assertEqual((second["rewrite"], second["commits_combined"], second["forced"]), ("squashed", 2, True))
+        self.assertEqual(self.remote_commits(branch), [second["pushed_commit"]])
+        self.assertEqual(self.git("show", "origin/%s:a.txt" % branch), "a fixed after review\n")
+        # Someone pushed to the branch meanwhile: never overwritten, nothing changed here.
+        self.push_upstream(branch, "x.txt", "x\n", "feat: MPS-93 colleague")
+        self.commit_file("c.txt", "c\n", "feat: MPS-93 c")
+        before = self.head()
+        self.assertEqual(self.push(branch)["error"], "remote_branch_ahead")
+        self.assertEqual(self.head(), before)
+        self.assertEqual(len(self.remote_commits(branch)), 2)
+
+    def test_lease_refuses_a_push_that_raced_with_a_colleague(self):
+        branch = "feature/MPS-94-a"
+        self.prepare(branch, "MPS-94")
+        self.commit_file("a.txt", "a\n", "feat: MPS-94 a")
+        self.push(branch)
+        self.commit_file("b.txt", "b\n", "feat: MPS-94 a")
+        real = mps.run_git_network
+
+        def racing(root, args, cfg):
+            if args[0] == "push":  # a colleague pushes between our fetch and our push
+                self.push_upstream(branch, "x.txt", "x\n", "feat: MPS-94 colleague")
+            return real(root, args, cfg)
+        with mock.patch.object(mps, "run_git_network", side_effect=racing):
+            raced = self.push(branch)
+        self.assertEqual(raced["error"], "remote_branch_changed")
+        self.assertTrue(raced["backup_ref"].startswith(mps.BACKUP_REF_PREFIX))
+        self.git("fetch", "-q", "origin")
+        self.assertIn("feat: MPS-94 colleague", self.git("log", "-1", "--format=%s", "origin/" + branch))
+
+    def test_colleague_commits_are_amended_only_after_consent(self):
+        branch = "feature/MPS-95-a"
+        if not os.path.isdir(self.other):
+            self.git("clone", "-q", self.origin, self.other, cwd=self.tmp)
+        self.git("config", "user.name", "Colleague", cwd=self.other)
+        self.git("config", "user.email", "colleague@example.com", cwd=self.other)
+        self.git("switch", "-q", "-c", branch, "origin/develop", cwd=self.other)
+        self.commit_file("x.txt", "x\n", "feat: MPS-95 Phần của đồng nghiệp", cwd=self.other)
+        self.git("push", "-q", "origin", branch, cwd=self.other)
+        theirs = self.git("rev-parse", "HEAD", cwd=self.other).strip()
+        self.assertEqual(self.prepare(branch, "MPS-95")["action"], "created_tracking")
+        self.commit_file("mine.txt", "m\n", "feat: MPS-95 Phần của tôi")
+        before = self.head()
+        asked = self.push(branch)
+        self.assertEqual(asked["error"], "amend_confirmation_required")
+        self.assertEqual(asked["other_authors"], ["Colleague <colleague@example.com>"])
+        self.assertEqual(asked["last_commit"]["sha"], theirs)
+        self.assertEqual((self.head(), self.remote_commits(branch)), (before, [theirs]))  # nothing changed yet
+        amended = self.push(branch, "--amend-confirmed")
+        self.assertEqual((amended["rewrite"], amended["forced"]), ("amended", True))
+        commits = self.remote_commits(branch)
+        self.assertEqual(commits, [amended["pushed_commit"]])
+        self.assertEqual(self.git("log", "-1", "--format=%an|%cn|%s", commits[0]).strip(),
+                         "Colleague|Tester|feat: MPS-95 Phần của đồng nghiệp")
+        self.assertEqual(sorted(self.git("show", "--name-only", "--format=", commits[0]).split()),
+                         ["mine.txt", "x.txt"])
+
+    def test_rebase_is_skipped_instead_of_touching_local_changes_or_conflicting(self):
+        branch = "feature/MPS-96-a"
+        self.prepare(branch, "MPS-96")
+        self.commit_file("a.txt", "a\n", "feat: MPS-96 a")
+        merge_base = self.git("rev-parse", "origin/develop").strip()
+        self.push_upstream("develop", "app.txt", "line1\nline2 upstream\n", "feat: MPS-97 upstream")
+        self.write("app.txt", "line1\nline2 local edit\n")  # uncommitted, would be overwritten by the rebase
+        local = self.push(branch)
+        self.assertEqual((local["rebased"], local["rebase_skipped"]), (False, "local_changes"))
+        self.assertEqual(self.git("rev-parse", local["pushed_commit"] + "^").strip(), merge_base)
+        self.assertEqual(self.read("app.txt"), "line1\nline2 local edit\n")
+        self.git("checkout", "-q", "--", "app.txt")
+        self.commit_file("app.txt", "line1\nline2 mine\n", "feat: MPS-96 a")
+        conflict = self.push(branch)
+        self.assertEqual((conflict["rewrite"], conflict["rebased"], conflict["rebase_skipped"]),
+                         ("squashed", False, "conflict"))
+        self.assertEqual(self.remote_commits(branch), [conflict["pushed_commit"]])
+
+    def test_merged_in_work_from_other_branches_is_never_squashed_in(self):
+        # Unreleased develop work merged into a release bugfix branch must not ship as "fix: MPS-7".
+        self.prepare("bugfix/MPS-7-x", "MPS-7", "release/1.0")
+        self.commit_file("fix.txt", "fix\n", "fix: MPS-7 x")
+        self.git("merge", "-q", "--no-edit", "origin/develop")
+        refused = self.mps("git", "push", "--branch=bugfix/MPS-7-x", "--base=release/1.0")
+        self.assertEqual(refused["error"], "merged_foreign_work")
+        self.assertEqual([c["subject"] for c in refused["commits"]], ["feat: MPS-5 unreleased feature"])
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "bugfix/MPS-7-x").strip(), "")
+        # A colleague's ticket branch merged into mine: their work never lands in my MR under my name.
+        self.git("switch", "-q", "develop")
+        self.git("clone", "-q", self.origin, self.other, cwd=self.tmp)
+        self.set_identity(self.other)
+        self.git("switch", "-q", "-c", "feature/MPS-8-y", "origin/develop", cwd=self.other)
+        self.commit_file("y.txt", "y\n", "feat: MPS-8 y", cwd=self.other)
+        self.git("push", "-q", "origin", "feature/MPS-8-y", cwd=self.other)
+        self.prepare("feature/MPS-98-a", "MPS-98")
+        self.commit_file("a.txt", "a\n", "feat: MPS-98 a")
+        self.git("fetch", "-q", "origin")
+        self.git("merge", "-q", "--no-edit", "origin/feature/MPS-8-y")
+        self.assertEqual(self.push("feature/MPS-98-a")["error"], "merged_foreign_work")
+        # A local commit written by someone else is not folded in silently either.
+        self.git("reset", "-q", "--hard", "HEAD~1")
+        self.write("z.txt", "z\n")
+        self.git("add", "z.txt")
+        self.git("commit", "-q", "--author=Someone <someone@example.com>", "-m", "feat: MPS-98 z")
+        foreign = self.push("feature/MPS-98-a")
+        self.assertEqual((foreign["error"], foreign["other_authors"]),
+                         ("foreign_author_commits", ["Someone <someone@example.com>"]))
+
+    def test_failed_push_after_the_rewrite_is_resumed(self):
+        branch = "feature/MPS-99-a"
+        self.prepare(branch, "MPS-99")
+        self.commit_file("a.txt", "a\n", "feat: MPS-99 a")
+        self.push(branch)
+        self.commit_file("b.txt", "b\n", "feat: MPS-99 a")
+        real = mps.run_git_network
+
+        def offline(root, args, cfg):
+            if args[0] == "push":
+                return mps.GitResult(128, "", "fatal: unable to access 'https://git/': Could not resolve host: git"), \
+                    False
+            return real(root, args, cfg)
+        with mock.patch.object(mps, "run_git_network", side_effect=offline):
+            failed = self.push(branch)
+        self.assertEqual(failed["error"], "network_unreachable")
+        self.assertEqual(len(self.git("rev-list", "origin/develop.." + branch).split()), 1)  # rewritten locally
+        retried = self.push(branch)  # same command again, once the VPN is back
+        self.assertEqual((retried["ok"], retried["resumed"], retried["forced"]), (True, True, True))
+        self.assertEqual(self.remote_commits(branch), [retried["pushed_commit"]])
+        pending = subprocess.run(["git", "config", "--local", "--get-regexp", "mps-rewrite"], cwd=self.repo,
+                                 capture_output=True, encoding="utf-8").stdout
+        self.assertEqual(pending.strip(), "")  # the pending-rewrite note is cleared after a successful push
+        # Failed again, then one more commit before the retry: still one commit, nothing lost.
+        self.commit_file("c.txt", "c\n", "feat: MPS-99 a")
+        with mock.patch.object(mps, "run_git_network", side_effect=offline):
+            self.assertEqual(self.push(branch)["error"], "network_unreachable")
+        self.commit_file("d.txt", "d\n", "feat: MPS-99 a")
+        again = self.push(branch)
+        self.assertEqual((again["resumed"], again["forced"]), (True, True))
+        commits = self.remote_commits(branch)
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(sorted(self.git("show", "--name-only", "--format=", commits[0]).split()),
+                         ["a.txt", "b.txt", "c.txt", "d.txt"])
+
+    def test_rebase_never_touches_untracked_ignored_or_staged_files(self):
+        branch = "feature/MPS-100-a"
+        self.prepare(branch, "MPS-100")
+        self.commit_file("a.txt", "a\n", "feat: MPS-100 a")
+        self.push_upstream("develop", "cfg/local.txt", "from develop\n", "feat: MPS-101 adds cfg/local.txt")
+        self.write("cfg/local.txt", "MY LOCAL WORK\n")  # untracked here (ignored works the same)
+        skipped = self.push(branch)
+        self.assertEqual((skipped["rebased"], skipped["rebase_skipped"]), (False, "local_files"))
+        self.assertEqual(self.read("cfg/local.txt"), "MY LOCAL WORK\n")
+        os.remove(os.path.join(self.repo, "cfg", "local.txt"))
+        self.write("app.txt", "line1\nstaged\n")
+        self.git("add", "app.txt")
+        staged = self.push(branch)
+        self.assertEqual(staged["rebase_skipped"], "staged_changes")
+        self.assertEqual(self.git("diff", "--cached", "--name-only").split(), ["app.txt"])  # still staged
+
+    def test_half_updated_work_tree_stops_before_pushing(self):
+        branch = "feature/MPS-102-a"
+        self.prepare(branch, "MPS-102")
+        self.commit_file("a.txt", "a\n", "feat: MPS-102 a")
+        self.push_upstream("develop", "dev.txt", "d\n", "feat: MPS-103 upstream")
+        before = self.head()
+        real = mps.run_git
+
+        def locked(args, cwd, **kwargs):
+            if args[:2] == ["reset", "-q"] and "--keep" in args:  # e.g. Windows: a file held open by the editor
+                with open(os.path.join(cwd, "dev.txt"), "w") as handle:
+                    handle.write("d\n")
+                return mps.GitResult(128, "", "error: unable to unlink old 'x': Permission denied")
+            return real(args, cwd, **kwargs)
+        with mock.patch.object(mps, "run_git", side_effect=locked):
+            stopped = self.push(branch)
+        self.assertEqual(stopped["error"], "rebase_partial")
+        self.assertEqual(self.head(), before)
+        self.assertEqual(self.git("rev-parse", stopped["backup_ref"]).strip(), before)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", branch).strip(), "")
+
+    def test_amend_never_targets_a_commit_without_the_ticket_key(self):
+        branch = "feature/MPS-104-a"
+        self.git("clone", "-q", self.origin, self.other, cwd=self.tmp)
+        self.git("config", "user.name", "Tester", cwd=self.other)  # same name, another email (e.g. a 2nd laptop)
+        self.git("config", "user.email", "tester@home.example", cwd=self.other)
+        self.git("switch", "-q", "-c", branch, "origin/develop", cwd=self.other)
+        self.commit_file("x.txt", "x\n", "feat: MPS-104 a", cwd=self.other)
+        self.git("push", "-q", "origin", branch, cwd=self.other)
+        self.prepare(branch, "MPS-104")
+        self.commit_file("mine.txt", "m\n", "feat: MPS-104 a")
+        asked = self.push(branch)
+        self.assertEqual((asked["error"], asked["same_name_as_you"]), ("amend_confirmation_required", True))
+        # A reviewer's suggestion applied on GitLab: no ticket key, someone else's name -> never amended into.
+        self.commit_file("x.txt", "x suggested\n", "Apply 1 suggestion(s) to 1 file(s)", cwd=self.other)
+        self.git("push", "-q", "origin", branch, cwd=self.other)
+        self.git("fetch", "-q", "origin")
+        self.git("reset", "-q", "--hard", "origin/" + branch)
+        self.commit_file("mine.txt", "m\n", "feat: MPS-104 a")
+        refused = self.push(branch, "--amend-confirmed")
+        self.assertEqual(refused["error"], "amend_target_foreign")
+        self.assertEqual(refused["last_commit"]["subject"], "Apply 1 suggestion(s) to 1 file(s)")
 
     def test_push_refuses_secret_and_review_bundle_hides_env(self):
         self.prepare("feature/MPS-1-x", "MPS-1")
