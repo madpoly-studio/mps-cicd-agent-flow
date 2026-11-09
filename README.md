@@ -347,6 +347,10 @@ Từ bản 0.2.2, máy nào còn cài plugin từ repo cũ sẽ **bị chặn ch
 1. Làm trên nhánh riêng; tăng `VERSION` trong `mps.py` và `version` trong `plugin.json` (cùng một giá trị: bản vá
    cho sửa lỗi/tài liệu, bản minor cho tính năng hoặc thay đổi quy trình) và thêm một mục vào `CHANGELOG.md`.
    Không ghi `version` trong `marketplace.json`.
+   Thêm cả một mục cùng phiên bản vào `plugins/mps-git-flow/RELEASE_NOTES.md`: vài gạch đầu dòng ngắn, viết cho
+   người dùng (kể cả không phải developer), không mã lỗi hay tên lệnh nội bộ. Sau khi cập nhật, lần mở Claude Code kế
+   tiếp tự hiện mục này cho từng thành viên (hook `hooks/whats-new.sh`, một lần cho mỗi phiên bản; máy nhớ phiên bản
+   đã hiện ở `~/.claude/mps-git-flow/last_seen_version`). Bỏ qua nhiều phiên bản thì hiện gộp, tối đa 5 bản.
 2. Chạy `py -3 -m unittest discover -s tests -v` (test kiểm tra các phiên bản khớp nhau).
 3. Khi thay đổi đụng tới cài đặt / cập nhật, chạy danh sách kiểm tra thủ công bên dưới và ghi kết quả vào MR.
 4. Tạo MR vào `main`; tuỳ chọn gắn tag `v<phiên bản>` lên commit merge. Thành viên tự nhận bản mới.
@@ -386,8 +390,10 @@ Kiểm tra thủ công (máy thật, ngoài phần test tự động):
 CHANGELOG.md                               # nhật ký thay đổi theo phiên bản
 plugins/mps-git-flow/
   .claude-plugin/plugin.json               # phiên bản plugin (nguồn duy nhất)
-  hooks/hooks.json                         # hook SessionStart: nhắc gỡ bản cài từ repo cá nhân cũ
-  hooks/legacy-source-check.sh             # script của hook đó (bash)
+  RELEASE_NOTES.md                         # "có gì mới" theo phiên bản, viết cho người dùng (hiện sau khi cập nhật)
+  hooks/hooks.json                         # hook SessionStart (2 script bên dưới)
+  hooks/legacy-source-check.sh             # nhắc gỡ bản cài từ repo cá nhân cũ (bash)
+  hooks/whats-new.sh                       # hiện "có gì mới" một lần sau mỗi lần cập nhật (bash)
   skills/mps-git-flow/
     SKILL.md                               # quy trình cho Claude
     scripts/mps.py                         # CLI Python (chỉ thư viện chuẩn), in ra JSON

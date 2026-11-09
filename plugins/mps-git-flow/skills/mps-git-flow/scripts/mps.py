@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1

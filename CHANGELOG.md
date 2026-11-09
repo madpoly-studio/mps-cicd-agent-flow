@@ -1,7 +1,16 @@
 # Nhật ký thay đổi
 
 Mỗi lần merge vào `main` phải tăng phiên bản (`VERSION` trong `mps.py` và `version` trong `plugin.json`, cùng một
-giá trị) và thêm một mục ở đây. Mục mới nhất ở trên cùng.
+giá trị) và thêm một mục ở đây, cùng một mục ngắn cho người dùng trong `plugins/mps-git-flow/RELEASE_NOTES.md`.
+Mục mới nhất ở trên cùng.
+
+## 0.2.4 - 2026-11-09
+- `plugins/mps-git-flow/RELEASE_NOTES.md` mới: "có gì mới" theo từng phiên bản, viết cho người dùng (có cả các bản
+  trước).
+- Hook `SessionStart` mới `hooks/whats-new.sh`: lần mở Claude Code đầu tiên sau khi plugin lên phiên bản mới, hiện
+  mục của các phiên bản chưa xem (tối đa 5; máy chưa có trạng thái thì chỉ bản đang cài), một lần cho mỗi phiên
+  bản. Đọc file đi kèm plugin, không cần mạng; trạng thái ở `~/.claude/mps-git-flow/last_seen_version`
+  (hoặc `CLAUDE_CONFIG_DIR`).
 
 ## 0.2.3 - 2026-11-08
 - `jira create`: Bug mới được tự đưa vào sprint đang chạy của board; Story mới phải chọn `--sprint=active` hoặc

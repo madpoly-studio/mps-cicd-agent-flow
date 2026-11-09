@@ -1,5 +1,5 @@
 {
-  "description": "mps-git-flow: nhắc chuyển plugin từ repo cá nhân cũ sang repo dùng chung của tổ chức",
+  "description": "mps-git-flow: nhắc chuyển plugin từ repo cá nhân cũ sang repo dùng chung của tổ chức; hiện có gì mới sau mỗi lần cập nhật",
   "hooks": {
     "SessionStart": [
       {
@@ -8,6 +8,11 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/legacy-source-check.sh\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/whats-new.sh\"",
             "timeout": 10
           }
         ]

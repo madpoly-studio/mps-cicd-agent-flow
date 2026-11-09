@@ -2755,6 +2755,18 @@ class ReleaseDisciplineTests(unittest.TestCase):
         changelog = _read_bytes(os.path.join(REPO_ROOT, "CHANGELOG.md")).decode("utf-8")
         self.assertRegex(changelog, r"(?m)^## " + re.escape(mps.VERSION) + r"(\s|$)")
 
+    def test_release_notes_cover_every_version_newest_first(self):
+        """What members see after an update (hooks/whats-new.sh) must exist for every version, newest on top."""
+        def versions(path):
+            text = _read_bytes(path).decode("utf-8").replace("\r\n", "\n")
+            return re.findall(r"(?m)^## (\S+)", text), text
+        notes, text = versions(os.path.join(PLUGIN_DIR, "RELEASE_NOTES.md"))
+        changelog, _ = versions(os.path.join(REPO_ROOT, "CHANGELOG.md"))
+        self.assertEqual(notes[0], mps.VERSION)
+        self.assertEqual(notes, changelog)
+        for section in re.split(r"(?m)^## \S+.*$", text)[1:]:
+            self.assertRegex(section, r"(?m)^- \S")  # at least one bullet per version
+
     def test_marketplace_has_no_plugin_version(self):
         marketplace = json.loads(_read_bytes(os.path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"))
                                  .decode("utf-8"))
@@ -3799,6 +3811,100 @@ class LegacyPluginSourceTests(unittest.TestCase):
             self.assertIsNone(self.run_hook(), source)
         self.write_known(_known({"source": "git", "url": "git@github.com:hung-bui-121/mps-cdci-agents.git"}))
         self.assertIsNotNone(self.run_hook())
+
+
+WHATS_NEW_SH = os.path.join(HOOKS_DIR, "whats-new.sh")
+
+
+class WhatsNewHookTests(unittest.TestCase):
+    """hooks/whats-new.sh: release notes shown once per new version, from the notes shipped with the plugin."""
+
+    NOTES = ("# Có gì mới\n\nGiới thiệu.\n\n"
+             "## 0.4.0 - 2026-12-01\n- Chưa phát hành.\n\n"
+             "## 0.3.0 - 2026-11-20\n- Tính năng \"mới\" C:\\path\tvới tab.\n- Dòng dài\n  được nối tiếp.\n\n"
+             "## 0.2.0 - 2026-11-10\n- Bản hai.\n\n"
+             "## 0.1.0\n- Bản đầu.\n")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mps-whatsnew-")
+        self.addCleanup(_rmtree, self.tmp)
+        self.root = os.path.join(self.tmp, "plugin")
+        self.config = os.path.join(self.tmp, "config")
+        os.makedirs(os.path.join(self.root, ".claude-plugin"))
+        self.install("0.3.0")
+        # Windows checkouts (autocrlf) give the notes CRLF line endings: the hook must cope.
+        with open(os.path.join(self.root, "RELEASE_NOTES.md"), "w", encoding="utf-8", newline="\r\n") as handle:
+            handle.write(self.NOTES)
+
+    def install(self, version):
+        with open(os.path.join(self.root, ".claude-plugin", "plugin.json"), "w", encoding="utf-8",
+                  newline="\r\n") as handle:
+            handle.write('{\n  "name": "mps-git-flow",\n  "version": "%s"\n}\n' % version)
+
+    def state_path(self):
+        return os.path.join(self.config, "mps-git-flow", "last_seen_version")
+
+    def seen(self, version):
+        os.makedirs(os.path.dirname(self.state_path()), exist_ok=True)
+        with open(self.state_path(), "w", encoding="utf-8") as handle:
+            handle.write(version + "\n")
+
+    def run_hook(self):
+        env = dict(os.environ, CLAUDE_PLUGIN_ROOT=self.root.replace("\\", "/"),
+                   CLAUDE_CONFIG_DIR=self.config.replace("\\", "/"))
+        result = subprocess.run([BASH, WHATS_NEW_SH.replace("\\", "/")], env=env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout.decode("utf-8").strip()
+        return json.loads(out) if out else None
+
+    def test_shipped_hook_is_registered_and_lf(self):
+        with open(os.path.join(HOOKS_DIR, "hooks.json"), encoding="utf-8") as handle:
+            commands = [hook["command"] for group in json.load(handle)["hooks"]["SessionStart"]
+                        for hook in group["hooks"]]
+        self.assertIn('bash "${CLAUDE_PLUGIN_ROOT}/hooks/whats-new.sh"', commands)
+        self.assertNotIn(b"\r", _read_bytes(WHATS_NEW_SH))
+
+    @unittest.skipIf(BASH is None, "bash (Git Bash on Windows) not found")
+    def test_first_run_shows_only_the_installed_version_once(self):
+        shown = self.run_hook()
+        message = shown["systemMessage"]
+        self.assertTrue(message.startswith("mps-git-flow bản 0.3.0 - có gì mới:\nBản 0.3.0:\n"), message)
+        self.assertIn('- Tính năng "mới" C:\\path với tab.', message)  # quotes / backslash / tab survive JSON
+        self.assertIn("- Dòng dài được nối tiếp.", message)
+        for other in ("0.4.0", "0.2.0", "Bản đầu", "Giới thiệu", "\r"):
+            self.assertNotIn(other, message)
+        self.assertIn("RELEASE_NOTES.md", message)
+        self.assertEqual(shown["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("0.3.0", shown["hookSpecificOutput"]["additionalContext"])
+        with open(self.state_path(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read().strip(), "0.3.0")
+        self.assertIsNone(self.run_hook())  # once per version
+
+    @unittest.skipIf(BASH is None, "bash (Git Bash on Windows) not found")
+    def test_update_shows_every_version_since_the_last_one_seen(self):
+        self.seen("0.1.0")
+        message = self.run_hook()["systemMessage"]
+        self.assertIn("Bản 0.3.0:", message)
+        self.assertIn("Bản 0.2.0:\n- Bản hai.", message)
+        self.assertNotIn("Bản 0.1.0", message)
+        self.assertNotIn("0.4.0", message)  # newer than what is installed
+        self.assertLess(message.index("Bản 0.3.0"), message.index("Bản 0.2.0"))
+        self.install("0.4.0")
+        newer = self.run_hook()["systemMessage"]  # last seen is now 0.3.0
+        self.assertIn("Bản 0.4.0:\n- Chưa phát hành.", newer)
+        self.assertNotIn("Bản 0.3.0", newer)
+
+    @unittest.skipIf(BASH is None, "bash (Git Bash on Windows) not found")
+    def test_unknown_last_version_or_missing_notes(self):
+        self.seen("9.9.9")  # e.g. a downgrade: only the installed version
+        message = self.run_hook()["systemMessage"]
+        self.assertIn("Bản 0.3.0:", message)
+        self.assertNotIn("Bản 0.2.0", message)
+        self.install("0.5.0")  # a version without notes: nothing to show, nothing breaks
+        self.assertIsNone(self.run_hook())
+        os.remove(os.path.join(self.root, "RELEASE_NOTES.md"))
+        self.install("0.6.0")
+        self.assertIsNone(self.run_hook())
 
 
 if __name__ == "__main__":
