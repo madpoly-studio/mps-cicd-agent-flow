@@ -1300,9 +1300,20 @@ class GitFlowTests(unittest.TestCase):
             handle.write(b"x" * LARGE_FILE_BYTES)
         with open(os.path.join(self.repo, "dump.dat"), "wb") as handle:
             handle.write(b"x" * LARGE_FILE_BYTES)
-        preflight = self.mps("git", "preflight", "--base", "develop")
+        with open(os.path.join(self.repo, "texture.dat"), "wb") as handle:
+            handle.write(b"x" * (LARGE_FILE_BYTES // 2))
+        with mock.patch.object(mps, "LARGE_FILE_BLOCK_BYTES", LARGE_FILE_BYTES - 1024):
+            preflight = self.mps("git", "preflight", "--base", "develop")
         large = [b for b in preflight["blockers"] if b["code"] == "large_file"][0]
         self.assertEqual([f["file"] for f in large["files"]], ["dump.dat"])
+
+    def test_large_file_limit_is_above_review_read_limit(self):
+        # Files over the review read limit (5MB) are still allowed up to the push limit (GitLab has no size limit).
+        self.assertGreater(mps.LARGE_FILE_BLOCK_BYTES, mps.MAX_FILE_BYTES)
+        with open(os.path.join(self.repo, "texture.dat"), "wb") as handle:
+            handle.write(b"x" * (mps.MAX_FILE_BYTES + 1024))
+        preflight = self.mps("git", "preflight", "--base", "develop")
+        self.assertEqual([b for b in preflight["blockers"] if b["code"] == "large_file"], [])
 
     # -- M5 --------------------------------------------------------------
 

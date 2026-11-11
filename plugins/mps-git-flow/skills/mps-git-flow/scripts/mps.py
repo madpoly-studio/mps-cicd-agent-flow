@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -136,7 +136,11 @@ GITLAB_PER_PAGE = 100
 JIRA_PAGE_SIZE = 50
 MAX_PAGES = 50
 
+# Largest file read for review / secret scan; bigger files are reviewed at file level only.
 MAX_FILE_BYTES = 5 * 1024 * 1024
+# Changed files above this (and not in Git LFS) block the commit (`large_file`). The team's GitLab has no file
+# size limit; this only catches builds / dumps added by mistake.
+LARGE_FILE_BLOCK_BYTES = 100 * 1024 * 1024
 SLUG_MAX_LEN = 50
 JIRA_SUMMARY_MAX_LEN = 255
 REVIEW_CAP_CHARS = 200 * 1000
@@ -4330,7 +4334,7 @@ def cmd_git_preflight(args):
     lfs_paths = lfs_tracked(root, changed)
     for path in changed:
         full = os.path.join(root, path)
-        if path not in lfs_paths and os.path.isfile(full) and os.path.getsize(full) > MAX_FILE_BYTES:
+        if path not in lfs_paths and os.path.isfile(full) and os.path.getsize(full) > LARGE_FILE_BLOCK_BYTES:
             large.append({"file": path, "bytes": os.path.getsize(full)})
         if path in status["untracked"] and not is_env_file(path) and path not in lfs_paths:
             text, _, kind = _read_worktree_file(root, path, 0)
@@ -4347,7 +4351,8 @@ def cmd_git_preflight(args):
                                     "dùng xác nhận đó không phải bí mật thật."})
     if large:
         blockers.append({"code": "large_file", "files": large,
-                         "message": "Có file lớn hơn 5MB. Không nên đưa file lớn lên git — hãy hỏi developer."})
+                         "message": "Có file lớn hơn %dMB. Không nên đưa file lớn lên git — hãy hỏi developer." % (
+                             LARGE_FILE_BLOCK_BYTES // (1024 * 1024))})
 
     git_name, git_email = git_identity(root)
     if not git_name or not git_email:

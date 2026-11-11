@@ -4,6 +4,9 @@ Mỗi phiên bản có một mục ngắn ở đây (mới nhất ở trên), vi
 Claude Code kế tiếp sẽ tự hiện mục của phiên bản mới (một lần cho mỗi phiên bản). Chi tiết kỹ thuật: `CHANGELOG.md`
 ở gốc repo.
 
+## 0.3.1 - 2026-11-11
+- Được đẩy file lớn hơn: Claude chỉ chặn file trên 100MB (trước đây là 5MB).
+
 ## 0.3.0 - 2026-11-09
 - Quy tắc mới của team: mỗi merge request chỉ có một commit. Bạn vẫn commit bao nhiêu lần cũng được; khi đẩy lên,
   Claude tự gộp thành một commit đặt tên đúng quy tắc.

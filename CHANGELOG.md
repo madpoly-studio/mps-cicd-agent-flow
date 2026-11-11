@@ -4,6 +4,12 @@ Mỗi lần merge vào `main` phải tăng phiên bản (`VERSION` trong `mps.py
 giá trị) và thêm một mục ở đây, cùng một mục ngắn cho người dùng trong `plugins/mps-git-flow/RELEASE_NOTES.md`.
 Mục mới nhất ở trên cùng.
 
+## 0.3.1 - 2026-11-11
+- Nâng ngưỡng chặn file lớn khi commit (`large_file` trong `git preflight`) từ 5MB lên 100MB
+  (`LARGE_FILE_BLOCK_BYTES`), vì GitLab của team không giới hạn kích thước file. File trong Git LFS vẫn không bị
+  chặn. Giới hạn đọc file cho review code / quét bí mật (`MAX_FILE_BYTES`) vẫn là 5MB: file lớn hơn chỉ được
+  review ở mức file.
+
 ## 0.3.0 - 2026-11-09
 - Quy tắc mới: mỗi merge request chỉ có một commit, dùng rebase thay cho merge commit. `git push` gộp mọi commit
   của nhánh ticket (kể cả commit "Merge remote-tracking branch ...") thành một commit theo `--message` (mặc định:
